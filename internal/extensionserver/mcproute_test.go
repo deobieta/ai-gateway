@@ -6,6 +6,7 @@
 package extensionserver
 
 import (
+	"math"
 	"testing"
 
 	egextension "github.com/envoyproxy/gateway/proto/extension"
@@ -24,6 +25,7 @@ import (
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 )
@@ -198,7 +200,7 @@ func TestServer_modifyMCPGatewayGeneratedCluster(t *testing.T) {
 		expectedClusters []*clusterv3.Cluster
 	}{
 		{
-			name: "modifies MCP cluster",
+			name: "modifies MCP cluster, defaults to generous circuit breakers when none set",
 			clusters: []*clusterv3.Cluster{
 				{Name: "normal-cluster"},
 				{Name: internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0"},
@@ -232,6 +234,72 @@ func TestServer_modifyMCPGatewayGeneratedCluster(t *testing.T) {
 									},
 								},
 							},
+						},
+					},
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{
+								MaxConnections:     wrapperspb.UInt32(math.MaxInt32),
+								MaxPendingRequests: wrapperspb.UInt32(math.MaxInt32),
+								MaxRequests:        wrapperspb.UInt32(math.MaxInt32),
+								MaxRetries:         wrapperspb.UInt32(math.MaxInt32),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "preserves explicit BackendTrafficPolicy-sourced circuit breakers",
+			clusters: []*clusterv3.Cluster{
+				{Name: "normal-cluster"},
+				{
+					Name: internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0",
+					// Simulates what Envoy Gateway's core translator would have already set from
+					// a BackendTrafficPolicy targeting this HTTPRoute, before this hook runs.
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{MaxConnections: wrapperspb.UInt32(42)},
+						},
+					},
+				},
+			},
+			expectedClusters: []*clusterv3.Cluster{
+				{Name: "normal-cluster"},
+				{
+					Name:                 internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0",
+					ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+					ConnectTimeout:       &durationpb.Duration{Seconds: 10},
+					LoadAssignment: &endpointv3.ClusterLoadAssignment{
+						ClusterName: internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0",
+						Endpoints: []*endpointv3.LocalityLbEndpoints{
+							{
+								LbEndpoints: []*endpointv3.LbEndpoint{
+									{
+										HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
+											Endpoint: &endpointv3.Endpoint{
+												Address: &corev3.Address{
+													Address: &corev3.Address_SocketAddress{
+														SocketAddress: &corev3.SocketAddress{
+															Address: "127.0.0.1",
+															PortSpecifier: &corev3.SocketAddress_PortValue{
+																PortValue: internalapi.MCPProxyPort,
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					// Explicit value from the BackendTrafficPolicy must survive unchanged - the
+					// generous default must NOT override a user's explicit config.
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{MaxConnections: wrapperspb.UInt32(42)},
 						},
 					},
 				},

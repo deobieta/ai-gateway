@@ -8,6 +8,7 @@ package extensionserver
 import (
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	aigv1b1 "github.com/envoyproxy/ai-gateway/api/v1beta1"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
@@ -277,10 +279,27 @@ func (s *Server) createRoutesForBackendListener(routes []*routev3.RouteConfigura
 
 // modifyMCPGatewayGeneratedRoutes finds the mcp proxy dummy IP in the clusters and
 // swaps it to the localhost.
+//
+// This replaces the entire Cluster proto (required because the discovery type must
+// change from the core translator's EDS to STATIC to inline the loopback endpoint, and
+// the separately-delivered EDS resource for the dummy IP can't be intercepted/rewritten
+// here). CircuitBreakers has nothing to do with discovery type, so it's preserved across
+// the replace rather than silently dropped: see AEP-313.
 func (s *Server) modifyMCPGatewayGeneratedCluster(clusters []*clusterv3.Cluster) {
 	for _, c := range clusters {
 		if strings.Contains(c.Name, internalapi.MCPMainHTTPRoutePrefix) && strings.HasSuffix(c.Name, "/rule/0") {
 			name := c.Name
+			circuitBreakers := c.CircuitBreakers
+			if circuitBreakers == nil {
+				// No BackendTrafficPolicy set explicit thresholds on this HTTPRoute, so default
+				// to a generous ceiling rather than falling back to Envoy's conservative 1024
+				// default. This cluster is an in-pod loopback to the extproc sidecar's MCP proxy
+				// (127.0.0.1) - there is no real network/backend capacity to protect, so a low
+				// default only serves to throttle legitimate same-pod traffic. Same precedent as
+				// upstream ai-gateway#1884 (mathetake: "why don't you just set MAXINT32 instead of
+				// adding an option?") for the other hardcoded extension-server clusters.
+				circuitBreakers = generousLoopbackCircuitBreakers()
+			}
 			*c = clusterv3.Cluster{
 				Name:                 name,
 				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
@@ -310,8 +329,31 @@ func (s *Server) modifyMCPGatewayGeneratedCluster(clusters []*clusterv3.Cluster)
 						},
 					},
 				},
+				CircuitBreakers: circuitBreakers,
 			}
 		}
+	}
+}
+
+// generousLoopbackCircuitBreakers returns circuit breaker thresholds sized for an in-pod
+// loopback cluster whose only "backend" is the pod's own extproc sidecar - not a real
+// network-bound service, so Envoy's conservative defaults (meant to protect real upstreams
+// from overload - 1024 for MaxConnections/MaxPendingRequests/MaxRequests, 3 for MaxRetries)
+// have no purpose here and only cause premature rejections under legitimate traffic. All
+// four thresholds get the same generous ceiling, including MaxRetries: a retry storm on
+// this loopback path would otherwise trip that circuit breaker independently of the other
+// three, reintroducing the same class of spurious rejection this fix exists to eliminate.
+// See AEP-313.
+func generousLoopbackCircuitBreakers() *clusterv3.CircuitBreakers {
+	return &clusterv3.CircuitBreakers{
+		Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+			{
+				MaxConnections:     wrapperspb.UInt32(math.MaxInt32),
+				MaxPendingRequests: wrapperspb.UInt32(math.MaxInt32),
+				MaxRequests:        wrapperspb.UInt32(math.MaxInt32),
+				MaxRetries:         wrapperspb.UInt32(math.MaxInt32),
+			},
+		},
 	}
 }
 
