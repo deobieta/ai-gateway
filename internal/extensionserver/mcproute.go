@@ -8,6 +8,7 @@ package extensionserver
 import (
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/envoyproxy/go-control-plane/pkg/wellknown"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	aigv1b1 "github.com/envoyproxy/ai-gateway/api/v1beta1"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
@@ -277,10 +279,18 @@ func (s *Server) createRoutesForBackendListener(routes []*routev3.RouteConfigura
 
 // modifyMCPGatewayGeneratedRoutes finds the mcp proxy dummy IP in the clusters and
 // swaps it to the localhost.
+//
+// This replaces the entire Cluster proto (required because the discovery type must
+// change from the core translator's EDS to STATIC to inline the loopback endpoint, and
+// the separately-delivered EDS resource for the dummy IP can't be intercepted/rewritten
+// here). CircuitBreakers has nothing to do with discovery type, so it's preserved across
+// the replace - and backfilled with a generous default where genuinely unset - rather
+// than silently dropped: see AEP-313.
 func (s *Server) modifyMCPGatewayGeneratedCluster(clusters []*clusterv3.Cluster) {
 	for _, c := range clusters {
 		if strings.Contains(c.Name, internalapi.MCPMainHTTPRoutePrefix) && strings.HasSuffix(c.Name, "/rule/0") {
 			name := c.Name
+			circuitBreakers := fillGenerousLoopbackCircuitBreakerDefaults(c.CircuitBreakers)
 			*c = clusterv3.Cluster{
 				Name:                 name,
 				ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
@@ -310,9 +320,50 @@ func (s *Server) modifyMCPGatewayGeneratedCluster(clusters []*clusterv3.Cluster)
 						},
 					},
 				},
+				CircuitBreakers: circuitBreakers,
 			}
 		}
 	}
+}
+
+// fillGenerousLoopbackCircuitBreakerDefaults backfills any genuinely unset threshold
+// field on cb with a generous MaxInt32 ceiling, creating cb and/or a default Thresholds
+// entry if needed. Already-set fields are left untouched - whether they came from a
+// BackendTrafficPolicy explicitly targeting this HTTPRoute, or from some other default
+// Envoy Gateway's core translator may have already attached before this hook ever runs.
+//
+// This is deliberately a per-field backfill rather than an all-or-nothing nil check: in
+// practice, cb can arrive non-nil but only partially populated (e.g. a lone MaxRetries
+// value from somewhere upstream of this hook, unrelated to any BackendTrafficPolicy on
+// this route) - treating that as "fully explicit, leave alone" would silently leave the
+// other fields unset, i.e. still exposed to Envoy's conservative 1024 default and the
+// same class of spurious rejection this fix exists to eliminate. This cluster is an
+// in-pod loopback to the extproc sidecar's own MCP proxy - not a real network-bound
+// service - so none of Envoy's conservative defaults (1024 for
+// MaxConnections/MaxPendingRequests/MaxRequests, 3 for MaxRetries) protect anything real
+// here. See AEP-313.
+func fillGenerousLoopbackCircuitBreakerDefaults(cb *clusterv3.CircuitBreakers) *clusterv3.CircuitBreakers {
+	if cb == nil {
+		cb = &clusterv3.CircuitBreakers{}
+	}
+	if len(cb.Thresholds) == 0 {
+		cb.Thresholds = []*clusterv3.CircuitBreakers_Thresholds{{}}
+	}
+	for _, t := range cb.Thresholds {
+		if t.MaxConnections == nil {
+			t.MaxConnections = wrapperspb.UInt32(math.MaxInt32)
+		}
+		if t.MaxPendingRequests == nil {
+			t.MaxPendingRequests = wrapperspb.UInt32(math.MaxInt32)
+		}
+		if t.MaxRequests == nil {
+			t.MaxRequests = wrapperspb.UInt32(math.MaxInt32)
+		}
+		if t.MaxRetries == nil {
+			t.MaxRetries = wrapperspb.UInt32(math.MaxInt32)
+		}
+	}
+	return cb
 }
 
 // extractMCPBackendFiltersFromMCPProxyListener scans through MCP proxy listeners to find HTTP filters

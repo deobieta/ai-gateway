@@ -6,6 +6,7 @@
 package extensionserver
 
 import (
+	"math"
 	"testing"
 
 	egextension "github.com/envoyproxy/gateway/proto/extension"
@@ -24,6 +25,7 @@ import (
 	"google.golang.org/protobuf/testing/protocmp"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
 
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 )
@@ -191,26 +193,41 @@ func TestServer_createRoutesForBackendListener(t *testing.T) {
 	}
 }
 
+// normalClusterName is a non-MCP cluster used across modifyMCPGatewayGeneratedCluster
+// test cases to assert it's left untouched by the hook.
+const normalClusterName = "normal-cluster"
+
+// mcpMainTestClusterName is the MCP main loopback cluster name used across
+// modifyMCPGatewayGeneratedCluster test cases.
+var mcpMainTestClusterName = internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0"
+
 func TestServer_modifyMCPGatewayGeneratedCluster(t *testing.T) {
+	generousThresholds := &clusterv3.CircuitBreakers_Thresholds{
+		MaxConnections:     wrapperspb.UInt32(math.MaxInt32),
+		MaxPendingRequests: wrapperspb.UInt32(math.MaxInt32),
+		MaxRequests:        wrapperspb.UInt32(math.MaxInt32),
+		MaxRetries:         wrapperspb.UInt32(math.MaxInt32),
+	}
+
 	tests := []struct {
 		name             string
 		clusters         []*clusterv3.Cluster
 		expectedClusters []*clusterv3.Cluster
 	}{
 		{
-			name: "modifies MCP cluster",
+			name: "no CircuitBreakers at all - defaults every field to the generous ceiling",
 			clusters: []*clusterv3.Cluster{
-				{Name: "normal-cluster"},
-				{Name: internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0"},
+				{Name: normalClusterName},
+				{Name: mcpMainTestClusterName},
 			},
 			expectedClusters: []*clusterv3.Cluster{
-				{Name: "normal-cluster"},
+				{Name: normalClusterName},
 				{
-					Name:                 internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0",
+					Name:                 mcpMainTestClusterName,
 					ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
 					ConnectTimeout:       &durationpb.Duration{Seconds: 10},
 					LoadAssignment: &endpointv3.ClusterLoadAssignment{
-						ClusterName: internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0",
+						ClusterName: mcpMainTestClusterName,
 						Endpoints: []*endpointv3.LocalityLbEndpoints{
 							{
 								LbEndpoints: []*endpointv3.LbEndpoint{
@@ -231,6 +248,139 @@ func TestServer_modifyMCPGatewayGeneratedCluster(t *testing.T) {
 										},
 									},
 								},
+							},
+						},
+					},
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{generousThresholds},
+					},
+				},
+			},
+		},
+		{
+			name: "fully explicit BackendTrafficPolicy value - preserved exactly, untouched",
+			clusters: []*clusterv3.Cluster{
+				{Name: normalClusterName},
+				{
+					Name: mcpMainTestClusterName,
+					// Simulates what Envoy Gateway's core translator would have already set
+					// from a BackendTrafficPolicy explicitly targeting this HTTPRoute.
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{
+								MaxConnections:     wrapperspb.UInt32(4096),
+								MaxPendingRequests: wrapperspb.UInt32(4096),
+								MaxRequests:        wrapperspb.UInt32(4096),
+								MaxRetries:         wrapperspb.UInt32(1024),
+							},
+						},
+					},
+				},
+			},
+			expectedClusters: []*clusterv3.Cluster{
+				{Name: normalClusterName},
+				{
+					Name:                 mcpMainTestClusterName,
+					ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+					ConnectTimeout:       &durationpb.Duration{Seconds: 10},
+					LoadAssignment: &endpointv3.ClusterLoadAssignment{
+						ClusterName: mcpMainTestClusterName,
+						Endpoints: []*endpointv3.LocalityLbEndpoints{
+							{
+								LbEndpoints: []*endpointv3.LbEndpoint{
+									{
+										HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
+											Endpoint: &endpointv3.Endpoint{
+												Address: &corev3.Address{
+													Address: &corev3.Address_SocketAddress{
+														SocketAddress: &corev3.SocketAddress{
+															Address: "127.0.0.1",
+															PortSpecifier: &corev3.SocketAddress_PortValue{
+																PortValue: internalapi.MCPProxyPort,
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{
+								MaxConnections:     wrapperspb.UInt32(4096),
+								MaxPendingRequests: wrapperspb.UInt32(4096),
+								MaxRequests:        wrapperspb.UInt32(4096),
+								MaxRetries:         wrapperspb.UInt32(1024),
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			// This is the real bug caught in live smoke-testing (AEP-313 follow-up): Envoy
+			// Gateway's core translator - or something else upstream of this hook, unrelated
+			// to any BackendTrafficPolicy - was already attaching a non-nil CircuitBreakers
+			// with only MaxRetries set, on every ai-eg-mcp-main-* cluster observed. The
+			// original nil-check fix never backfilled the other three fields in that case,
+			// so MaxConnections/MaxPendingRequests/MaxRequests stayed genuinely unset -
+			// still exposed to Envoy's conservative 1024 default at runtime.
+			name: "non-nil but only partially populated - backfills just the unset fields",
+			clusters: []*clusterv3.Cluster{
+				{Name: normalClusterName},
+				{
+					Name: mcpMainTestClusterName,
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{MaxRetries: wrapperspb.UInt32(1024)},
+						},
+					},
+				},
+			},
+			expectedClusters: []*clusterv3.Cluster{
+				{Name: normalClusterName},
+				{
+					Name:                 mcpMainTestClusterName,
+					ClusterDiscoveryType: &clusterv3.Cluster_Type{Type: clusterv3.Cluster_STATIC},
+					ConnectTimeout:       &durationpb.Duration{Seconds: 10},
+					LoadAssignment: &endpointv3.ClusterLoadAssignment{
+						ClusterName: mcpMainTestClusterName,
+						Endpoints: []*endpointv3.LocalityLbEndpoints{
+							{
+								LbEndpoints: []*endpointv3.LbEndpoint{
+									{
+										HostIdentifier: &endpointv3.LbEndpoint_Endpoint{
+											Endpoint: &endpointv3.Endpoint{
+												Address: &corev3.Address{
+													Address: &corev3.Address_SocketAddress{
+														SocketAddress: &corev3.SocketAddress{
+															Address: "127.0.0.1",
+															PortSpecifier: &corev3.SocketAddress_PortValue{
+																PortValue: internalapi.MCPProxyPort,
+															},
+														},
+													},
+												},
+											},
+										},
+									},
+								},
+							},
+						},
+					},
+					CircuitBreakers: &clusterv3.CircuitBreakers{
+						Thresholds: []*clusterv3.CircuitBreakers_Thresholds{
+							{
+								// MaxRetries preserved exactly as the pre-existing (non-ours)
+								// value - we never overwrite an already-set field.
+								MaxConnections:     wrapperspb.UInt32(math.MaxInt32),
+								MaxPendingRequests: wrapperspb.UInt32(math.MaxInt32),
+								MaxRequests:        wrapperspb.UInt32(math.MaxInt32),
+								MaxRetries:         wrapperspb.UInt32(1024),
 							},
 						},
 					},
@@ -569,7 +719,7 @@ func TestServer_maybeGenerateResourcesForMCPGateway(t *testing.T) {
 					},
 				},
 				Clusters: []*clusterv3.Cluster{
-					{Name: internalapi.MCPMainHTTPRoutePrefix + "foo-bar/rule/0"},
+					{Name: mcpMainTestClusterName},
 				},
 			},
 			check: func(t *testing.T, req *egextension.PostTranslateModifyRequest) {
